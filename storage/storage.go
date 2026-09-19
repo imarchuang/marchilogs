@@ -294,32 +294,32 @@ func (s *Storage) Close() error {
 	return s.Flush()
 }
 
-// Search runs: time partitions → stream index prune → block time prune → unpack columns → filter.
+// Search runs: in-memory parts + on-disk parts.
+// Buffered rows are visible immediately via inmemoryPart snapshots; Flush is not required.
+// Mem snapshot and the set of published disk parts are captured under one lock so a concurrent
+// Flush cannot make the same rows appear twice (once from mem, once from the newly published part).
 func (s *Storage) Search(q Query) ([]Entry, error) {
-	if err := s.Flush(); err != nil {
-		return nil, err
-	}
-
-	partitions, err := s.listPartitions(q.Start, q.End)
+	s.mu.Lock()
+	memParts := s.snapshotInmemoryLocked()
+	diskParts, err := s.listPublishedPartsLocked(q.Start, q.End)
+	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 
+	partitions := mergePartitionNames(keysOf(diskParts), memParts, q.Start, q.End)
+
 	var out []Entry
 	for _, partName := range partitions {
-		partsDir := filepath.Join(s.root, "partitions", partName, "parts")
-		partEntries, err := os.ReadDir(partsDir)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
+		if ip := memParts[partName]; ip != nil {
+			out = searchInmemoryPart(ip, q, out)
+			if q.Limit > 0 && len(out) >= q.Limit {
+				return out[:q.Limit], nil
 			}
-			return nil, err
 		}
-		for _, pe := range partEntries {
-			if !pe.IsDir() || !isPublishedPartDir(pe.Name()) {
-				continue
-			}
-			partDir := filepath.Join(partsDir, pe.Name())
+
+		for _, peName := range diskParts[partName] {
+			partDir := filepath.Join(s.root, "partitions", partName, "parts", peName)
 			candidates, err := s.streamsForPart(partDir, q.StreamEq)
 			if err != nil {
 				return nil, err
@@ -335,7 +335,6 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 				}
 				refs = filterBlockRefs(refs, q.Start, q.End)
 				for _, ref := range refs {
-					// Only now open columnar files for blocks that survived time prune.
 					dir := filepath.Join(partDir, ref.Path)
 					b, err := readBlock(dir)
 					if err != nil {
@@ -362,6 +361,49 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 		}
 	}
 	return out, nil
+}
+
+// listPublishedPartsLocked returns partition → published part dir names.
+// Caller must hold s.mu (pairs with mem snapshot for a consistent Search view).
+func (s *Storage) listPublishedPartsLocked(start, end time.Time) (map[string][]string, error) {
+	days, err := s.listPartitions(start, end)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string][]string{}, nil
+		}
+		return nil, err
+	}
+	out := make(map[string][]string, len(days))
+	for _, day := range days {
+		partsDir := filepath.Join(s.root, "partitions", day, "parts")
+		entries, err := os.ReadDir(partsDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		var names []string
+		for _, e := range entries {
+			if e.IsDir() && isPublishedPartDir(e.Name()) {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Strings(names)
+		if len(names) > 0 {
+			out[day] = names
+		}
+	}
+	return out, nil
+}
+
+func keysOf(m map[string][]string) []string {
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (s *Storage) streamsForPart(partDir string, streamEq map[string]string) (map[string]streamMeta, error) {
