@@ -75,15 +75,7 @@ func (b *memBlock) overlaps(start, end time.Time) bool {
 	if b.rows() == 0 {
 		return false
 	}
-	minT := time.Unix(0, b.timeMin).UTC()
-	maxT := time.Unix(0, b.timeMax).UTC()
-	if !end.IsZero() && minT.After(end) {
-		return false
-	}
-	if !start.IsZero() && maxT.Before(start) {
-		return false
-	}
-	return true
+	return timeRangeOverlaps(start, end, b.timeMin, b.timeMax)
 }
 
 func writeStringColumn(path string, values []string) error {
@@ -232,9 +224,16 @@ func fieldFileName(field string) string {
 	return safeStreamDir(field) + ".col"
 }
 
-func readBlock(dir string) (*memBlock, error) {
+// readBlockMeta loads only the block's meta.json (no columnar files).
+func readBlockMeta(dir string) (blockMeta, error) {
 	var meta blockMeta
-	if err := readJSON(filepath.Join(dir, "meta.json"), &meta); err != nil {
+	err := readJSON(filepath.Join(dir, "meta.json"), &meta)
+	return meta, err
+}
+
+func readBlock(dir string) (*memBlock, error) {
+	meta, err := readBlockMeta(dir)
+	if err != nil {
 		return nil, err
 	}
 	times, err := readTimeColumn(filepath.Join(dir, "_time.col"))
