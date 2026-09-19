@@ -1,0 +1,13 @@
+services:
+  marchilogs:
+    build: .
+    image: marchilogs:local
+    ports:
+      - "8080:8080"
+    volumes:
+      - marchilogs-data:/data
+    environment:
+      MARCHILOGS_STREAM_FIELDS: service,host
+
+volumes:
+  marchilogs-data:
