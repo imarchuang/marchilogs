@@ -19,8 +19,8 @@ data/wal/checkpoint    # highest seq known durable in published parts
 
 | Option | Meaning |
 |---|---|
-| `DisableWAL` | No WAL (tests / ephemeral) |
-| `WALSync` | `fsync` after each Append batch (default `true`) |
+| `EnableWAL` | Turn on WAL (default **off**) |
+| `WALSync` | `fsync` after each Append batch when WAL is on (default `true`) |
 
 ## Crash windows
 

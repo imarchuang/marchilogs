@@ -1,8 +1,6 @@
 package storage
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -10,6 +8,7 @@ import (
 func TestWALSurvivesCrashWithoutFlush(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir, Options{
+		EnableWAL:       true,
 		StreamFields:    []string{"service", "host"},
 		MaxRowsPerBlock: 1000,
 	})
@@ -32,6 +31,7 @@ func TestWALSurvivesCrashWithoutFlush(t *testing.T) {
 	s.mu.Unlock()
 
 	s2, err := Open(dir, Options{
+		EnableWAL:       true,
 		StreamFields:    []string{"service", "host"},
 		MaxRowsPerBlock: 1000,
 	})
@@ -47,12 +47,12 @@ func TestWALSurvivesCrashWithoutFlush(t *testing.T) {
 	if len(got) != 1 || got[0].Msg() != "durably buffered" {
 		t.Fatalf("want WAL replay hit, got %#v", got)
 	}
-	// Still only in mem/WAL, not necessarily published — ok.
 }
 
 func TestWALCheckpointAvoidsDuplicateAfterFlush(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir, Options{
+		EnableWAL:       true,
 		StreamFields:    []string{"service"},
 		MaxRowsPerBlock: 1000,
 	})
@@ -75,6 +75,7 @@ func TestWALCheckpointAvoidsDuplicateAfterFlush(t *testing.T) {
 	}
 
 	s2, err := Open(dir, Options{
+		EnableWAL:       true,
 		StreamFields:    []string{"service"},
 		MaxRowsPerBlock: 1000,
 	})
@@ -95,6 +96,7 @@ func TestWALCheckpointAvoidsDuplicateAfterFlush(t *testing.T) {
 func TestWALPartialFlushCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir, Options{
+		EnableWAL:       true,
 		StreamFields:    []string{"service"},
 		MaxRowsPerBlock: 1000,
 	})
@@ -125,7 +127,7 @@ func TestWALPartialFlushCheckpoint(t *testing.T) {
 	s.buffers = make(map[string]*memBlock)
 	s.mu.Unlock()
 
-	s2, err := Open(dir, Options{StreamFields: []string{"service"}, MaxRowsPerBlock: 1000})
+	s2, err := Open(dir, Options{EnableWAL: true, StreamFields: []string{"service"}, MaxRowsPerBlock: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,26 +146,20 @@ func TestWALPartialFlushCheckpoint(t *testing.T) {
 	}
 }
 
-func TestDisableWAL(t *testing.T) {
+func TestWALDisabledByDefault(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{DisableWAL: true, StreamFields: []string{"service"}})
+	s, err := Open(dir, Options{StreamFields: []string{"service"}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Close()
 	if err := s.Append(Entry{Fields: map[string]string{"_msg": "x", "service": "a"}}); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "wal")); !os.IsNotExist(err) {
-		// wal dir may not exist when disabled
-		if err == nil {
-			// ok if somehow created; but openWAL shouldn't run
-		}
 	}
 	s.mu.Lock()
 	hasWAL := s.wal != nil
 	s.mu.Unlock()
 	if hasWAL {
-		t.Fatal("expected nil wal when DisableWAL")
+		t.Fatal("expected nil wal by default")
 	}
-	_ = s.Close()
 }

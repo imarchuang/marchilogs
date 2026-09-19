@@ -20,8 +20,9 @@ type Options struct {
 	// MaxRowsPerBlock flushes a stream block when it reaches this many rows.
 	MaxRowsPerBlock int
 
-	// DisableWAL skips the write-ahead log (not crash-safe for unflushed buffers).
-	DisableWAL bool
+	// EnableWAL turns on the write-ahead log for unflushed buffers (default off).
+	// When disabled, unclean shutdown can lose data not yet Flush()'d to parts.
+	EnableWAL bool
 
 	// WALSync fsyncs the WAL after each Append batch (default true when WAL enabled).
 	// Set false for faster ingest with softer durability (OS buffer).
@@ -91,7 +92,7 @@ func Open(dir string, opts Options) (*Storage, error) {
 	if err := s.loadPartSeq(); err != nil {
 		return nil, err
 	}
-	if !opts.DisableWAL {
+	if opts.EnableWAL {
 		w, err := openWAL(dir, *opts.WALSync)
 		if err != nil {
 			return nil, err
