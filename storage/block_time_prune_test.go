@@ -53,8 +53,8 @@ func TestSearchPrunesBlockBeforeColumnRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// part meta must carry per-block time ranges
-	metaPath := filepath.Join(dir, "partitions", "20260319", "parts", "000001", "meta.json")
+	partDir := filepath.Join(dir, "partitions", "20260319", "parts", "000001")
+	metaPath := filepath.Join(partDir, "meta.json")
 	raw, err := os.ReadFile(metaPath)
 	if err != nil {
 		t.Fatal(err)
@@ -75,26 +75,52 @@ func TestSearchPrunesBlockBeforeColumnRead(t *testing.T) {
 		}
 	}
 
-	// morning-only window: must not return evening row
+	var eveningBlockDir string
+	for _, sm := range meta.Streams {
+		if sm.Tags["host"] == "h2" {
+			eveningBlockDir = filepath.Join(partDir, sm.Blocks[0].Path)
+			break
+		}
+	}
+	if eveningBlockDir == "" {
+		t.Fatal("evening stream block path not found in meta")
+	}
+
+	// Sabotage evening columnar files. If Search still opens this block for a
+	// morning-only query, readBlock will fail — catching "read columns then filter" regressions.
+	eveningTimeCol := filepath.Join(eveningBlockDir, "_time.col")
+	if err := os.Remove(eveningTimeCol); err != nil {
+		t.Fatalf("remove evening _time.col: %v", err)
+	}
+	// Also drop string columns so any partial open path fails loudly.
+	entries, err := os.ReadDir(eveningBlockDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".col" {
+			_ = os.Remove(filepath.Join(eveningBlockDir, e.Name()))
+		}
+	}
+
+	// Control: evening window must fail because columns are gone.
+	_, err = s.Search(Query{
+		Start: evening,
+		End:   evening.Add(time.Hour),
+	})
+	if err == nil {
+		t.Fatal("expected evening query to fail after deleting evening .col files")
+	}
+
+	// Morning window must still succeed — proves evening block was never opened.
 	got, err := s.Search(Query{
 		Start: morning,
 		End:   morning.Add(time.Hour),
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("morning query must not touch evening columns: %v", err)
 	}
 	if len(got) != 1 || got[0].Msg() != "am" {
 		t.Fatalf("want only am, got %#v", got)
-	}
-
-	// Prove evening block would be filtered by index alone (no need to open .col).
-	var eveningRefs []blockRef
-	for _, sm := range meta.Streams {
-		if sm.Tags["host"] == "h2" {
-			eveningRefs = sm.Blocks
-		}
-	}
-	if len(filterBlockRefs(eveningRefs, morning, morning.Add(time.Hour))) != 0 {
-		t.Fatal("evening blockRef must be pruned by morning query window")
 	}
 }
