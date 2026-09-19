@@ -1,0 +1,19 @@
+# Binaries
+*.exe
+*.test
+*.out
+/bin/
+/dist/
+
+# Go
+/vendor/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local data
+/data/
+*.log
