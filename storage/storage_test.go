@@ -91,3 +91,61 @@ func TestStreamIDStable(t *testing.T) {
 		t.Fatalf("got %q %q", a, b)
 	}
 }
+
+func TestStreamSubsetMatch(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, Options{StreamFields: []string{"service", "host"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Date(2026, 3, 19, 12, 0, 0, 0, time.UTC)
+	if err := s.Append(
+		Entry{Time: now, Fields: map[string]string{"_msg": "a1", "service": "api", "host": "h1"}},
+		Entry{Time: now, Fields: map[string]string{"_msg": "a2", "service": "api", "host": "h2"}},
+		Entry{Time: now, Fields: map[string]string{"_msg": "w1", "service": "worker", "host": "h1"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Search(Query{StreamEq: map[string]string{"service": "api"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("service=api: want 2, got %d %#v", len(got), got)
+	}
+	for _, e := range got {
+		if e.Fields["service"] != "api" {
+			t.Fatalf("leak: %+v", e.Fields)
+		}
+	}
+
+	got, err = s.Search(Query{StreamEq: map[string]string{"service": "api", "host": "h1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Msg() != "a1" {
+		t.Fatalf("api+h1: want a1, got %#v", got)
+	}
+}
+
+func TestMatchStreamIDsIntersect(t *testing.T) {
+	meta := buildPartMeta([]string{
+		"host=h1,service=api",
+		"host=h2,service=api",
+		"host=h1,service=worker",
+	}, 1, 2)
+	got := matchStreamIDs(meta, map[string]string{"service": "api"})
+	if len(got) != 2 {
+		t.Fatalf("want 2, got %#v", got)
+	}
+	got = matchStreamIDs(meta, map[string]string{"service": "api", "host": "h2"})
+	if len(got) != 1 || got["host=h2,service=api"].ID == "" {
+		t.Fatalf("want h2/api, got %#v", got)
+	}
+}
