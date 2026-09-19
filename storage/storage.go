@@ -38,7 +38,8 @@ type Query struct {
 	Start time.Time // inclusive; zero = no lower bound
 	End   time.Time // inclusive; zero = no upper bound
 
-	// StreamEq exact-matches stream identity fields (AND).
+	// StreamEq matches streams whose tags contain all of these field=value pairs (AND subset).
+	// Example: {service: "api"} matches host=h1,service=api and host=h2,service=api.
 	StreamEq map[string]string
 
 	// Contains does a case-sensitive substring match on _msg after unpacking the block.
@@ -203,12 +204,7 @@ func (s *Storage) flushPartitionLocked(partition string) error {
 		delete(s.buffers, it.key)
 	}
 
-	meta := map[string]any{
-		"streams":     streams,
-		"time_min_ns": tMin,
-		"time_max_ns": tMax,
-	}
-	return writeJSON(filepath.Join(partDir, "meta.json"), meta)
+	return writeJSON(filepath.Join(partDir, "meta.json"), buildPartMeta(streams, tMin, tMax))
 }
 
 // Close flushes and releases the storage.
@@ -216,15 +212,10 @@ func (s *Storage) Close() error {
 	return s.Flush()
 }
 
-// Search runs: time partitions → stream prune → block time prune → unpack columns → filter.
+// Search runs: time partitions → stream index prune → block time prune → unpack columns → filter.
 func (s *Storage) Search(q Query) ([]Entry, error) {
 	if err := s.Flush(); err != nil {
 		return nil, err
-	}
-
-	wantStream := ""
-	if len(q.StreamEq) > 0 {
-		wantStream = StreamID(s.opts.StreamFields, q.StreamEq)
 	}
 
 	partitions, err := s.listPartitions(q.Start, q.End)
@@ -246,32 +237,24 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 			if !pe.IsDir() {
 				continue
 			}
-			blocksDir := filepath.Join(partsDir, pe.Name(), "blocks")
-			blockDirs, err := os.ReadDir(blocksDir)
+			partDir := filepath.Join(partsDir, pe.Name())
+			candidates, err := s.streamsForPart(partDir, q.StreamEq)
 			if err != nil {
-				if os.IsNotExist(err) {
-					continue
-				}
 				return nil, err
 			}
-			for _, bd := range blockDirs {
-				if !bd.IsDir() {
-					continue
-				}
-				dir := filepath.Join(blocksDir, bd.Name())
+			if len(candidates) == 0 {
+				continue
+			}
+			blocksDir := filepath.Join(partDir, "blocks")
+			for _, sm := range candidates {
+				dir := filepath.Join(blocksDir, sm.Dir)
 				b, err := readBlock(dir)
 				if err != nil {
 					return nil, err
 				}
-				// stream prune
-				if wantStream != "" && b.stream != wantStream {
-					continue
-				}
-				// block time prune
 				if !b.overlaps(q.Start, q.End) {
 					continue
 				}
-				// unpack + row filter
 				for i := 0; i < b.rows(); i++ {
 					e := b.row(i)
 					if !q.Start.IsZero() && e.Time.Before(q.Start) {
@@ -290,6 +273,53 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 				}
 			}
 		}
+	}
+	return out, nil
+}
+
+func (s *Storage) streamsForPart(partDir string, streamEq map[string]string) (map[string]streamMeta, error) {
+	var meta partMeta
+	err := readJSON(filepath.Join(partDir, "meta.json"), &meta)
+	if err == nil && len(meta.Streams) > 0 {
+		if len(meta.ByTag) > 0 || len(streamEq) == 0 {
+			return matchStreamIDs(meta, streamEq), nil
+		}
+		// legacy: streams listed but no by_tag — filter by parsed tags
+		out := make(map[string]streamMeta)
+		for _, sm := range meta.Streams {
+			if sm.Tags == nil {
+				sm.Tags = ParseStreamTags(sm.ID)
+			}
+			if sm.Dir == "" {
+				sm.Dir = safeStreamDir(sm.ID)
+			}
+			if streamMatchesTags(sm.ID, streamEq) {
+				out[sm.ID] = sm
+			}
+		}
+		return out, nil
+	}
+
+	// very old / missing meta: scan block dirs and subset-match on directory name
+	blocksDir := filepath.Join(partDir, "blocks")
+	blockDirs, err := os.ReadDir(blocksDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make(map[string]streamMeta)
+	for _, bd := range blockDirs {
+		if !bd.IsDir() {
+			continue
+		}
+		// directory name is safeStreamDir(streamID); for our safe alphabet it equals streamID
+		id := bd.Name()
+		if !streamMatchesTags(id, streamEq) {
+			continue
+		}
+		out[id] = streamMeta{ID: id, Dir: bd.Name(), Tags: ParseStreamTags(id)}
 	}
 	return out, nil
 }
