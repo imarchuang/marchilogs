@@ -72,10 +72,58 @@ func Open(dir string, opts Options) (*Storage, error) {
 		buffers: make(map[string]*memBlock),
 		partSeq: make(map[string]int),
 	}
+	if err := s.cleanupOrphanPublishing(); err != nil {
+		return nil, err
+	}
 	if err := s.loadPartSeq(); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// publishingPrefix marks in-progress part directories. Readers must ignore them;
+// a successful Flush renames to a numeric id (atomic publish).
+const publishingPrefix = ".publishing-"
+
+func isPublishedPartDir(name string) bool {
+	if name == "" || strings.HasPrefix(name, ".") {
+		return false
+	}
+	_, err := strconv.Atoi(name)
+	return err == nil
+}
+
+func (s *Storage) cleanupOrphanPublishing() error {
+	partsRoot := filepath.Join(s.root, "partitions")
+	days, err := os.ReadDir(partsRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, d := range days {
+		if !d.IsDir() {
+			continue
+		}
+		partsDir := filepath.Join(partsRoot, d.Name(), "parts")
+		entries, err := os.ReadDir(partsDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		for _, e := range entries {
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), publishingPrefix) {
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(partsDir, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Storage) loadPartSeq() error {
@@ -98,7 +146,7 @@ func (s *Storage) loadPartSeq() error {
 			return err
 		}
 		for _, e := range entries {
-			if !e.IsDir() {
+			if !e.IsDir() || !isPublishedPartDir(e.Name()) {
 				continue
 			}
 			id, err := strconv.Atoi(e.Name())
@@ -175,11 +223,26 @@ func (s *Storage) flushPartitionLocked(partition string) error {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].b.stream < items[j].b.stream })
 
+	partsParent := filepath.Join(s.root, "partitions", partition, "parts")
+	if err := os.MkdirAll(partsParent, 0o755); err != nil {
+		return err
+	}
+
 	s.partSeq[partition]++
 	id := s.partSeq[partition]
-	partDir := filepath.Join(s.root, "partitions", partition, "parts", fmt.Sprintf("%06d", id))
-	blocksDir := filepath.Join(partDir, "blocks")
+	finalName := fmt.Sprintf("%06d", id)
+	finalDir := filepath.Join(partsParent, finalName)
+	tmpDir := filepath.Join(partsParent, publishingPrefix+finalName)
+	_ = os.RemoveAll(tmpDir)
+
+	rollback := func() {
+		_ = os.RemoveAll(tmpDir)
+		s.partSeq[partition]--
+	}
+
+	blocksDir := filepath.Join(tmpDir, "blocks")
 	if err := os.MkdirAll(blocksDir, 0o755); err != nil {
+		rollback()
 		return err
 	}
 
@@ -188,6 +251,7 @@ func (s *Storage) flushPartitionLocked(partition string) error {
 	for i, it := range items {
 		dir := filepath.Join(blocksDir, safeStreamDir(it.b.stream))
 		if err := it.b.writeTo(dir); err != nil {
+			rollback()
 			return err
 		}
 		infos = append(infos, streamFlushInfo{
@@ -206,10 +270,23 @@ func (s *Storage) flushPartitionLocked(partition string) error {
 				tMax = it.b.timeMax
 			}
 		}
-		delete(s.buffers, it.key)
 	}
 
-	return writeJSON(filepath.Join(partDir, "meta.json"), buildPartMeta(infos, tMin, tMax))
+	if err := writeJSON(filepath.Join(tmpDir, "meta.json"), buildPartMeta(infos, tMin, tMax)); err != nil {
+		rollback()
+		return err
+	}
+
+	// Atomic publish: part becomes visible to readers only after rename succeeds.
+	if err := os.Rename(tmpDir, finalDir); err != nil {
+		rollback()
+		return fmt.Errorf("publish part %s: %w", finalName, err)
+	}
+
+	for _, it := range items {
+		delete(s.buffers, it.key)
+	}
+	return nil
 }
 
 // Close flushes and releases the storage.
@@ -239,7 +316,7 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 			return nil, err
 		}
 		for _, pe := range partEntries {
-			if !pe.IsDir() {
+			if !pe.IsDir() || !isPublishedPartDir(pe.Name()) {
 				continue
 			}
 			partDir := filepath.Join(partsDir, pe.Name())
