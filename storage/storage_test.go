@@ -135,7 +135,7 @@ func TestStreamSubsetMatch(t *testing.T) {
 }
 
 func TestMatchStreamIDsIntersect(t *testing.T) {
-	meta := buildPartMeta([]string{
+	meta := buildPartMetaFromIDs([]string{
 		"host=h1,service=api",
 		"host=h2,service=api",
 		"host=h1,service=worker",

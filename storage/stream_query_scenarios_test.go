@@ -205,7 +205,7 @@ func TestComplexStreamIndexByTag(t *testing.T) {
 		"host=h1,service=api1",
 		"host=h1,service=api2",
 	}
-	meta := buildPartMeta(ids, 1, 2)
+	meta := buildPartMetaFromIDs(ids, 1, 2)
 
 	if got := matchStreamIDs(meta, map[string]string{"service": "api1"}); len(got) != 3 {
 		t.Fatalf("service=api1: want 3 streams, got %#v", got)

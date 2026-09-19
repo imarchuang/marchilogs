@@ -183,14 +183,19 @@ func (s *Storage) flushPartitionLocked(partition string) error {
 		return err
 	}
 
-	streams := make([]string, 0, len(items))
+	infos := make([]streamFlushInfo, 0, len(items))
 	var tMin, tMax int64
 	for i, it := range items {
 		dir := filepath.Join(blocksDir, safeStreamDir(it.b.stream))
 		if err := it.b.writeTo(dir); err != nil {
 			return err
 		}
-		streams = append(streams, it.b.stream)
+		infos = append(infos, streamFlushInfo{
+			ID:        it.b.stream,
+			TimeMinNS: it.b.timeMin,
+			TimeMaxNS: it.b.timeMax,
+			Rows:      it.b.rows(),
+		})
 		if i == 0 {
 			tMin, tMax = it.b.timeMin, it.b.timeMax
 		} else {
@@ -204,7 +209,7 @@ func (s *Storage) flushPartitionLocked(partition string) error {
 		delete(s.buffers, it.key)
 	}
 
-	return writeJSON(filepath.Join(partDir, "meta.json"), buildPartMeta(streams, tMin, tMax))
+	return writeJSON(filepath.Join(partDir, "meta.json"), buildPartMeta(infos, tMin, tMax))
 }
 
 // Close flushes and releases the storage.
@@ -247,28 +252,33 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 			}
 			blocksDir := filepath.Join(partDir, "blocks")
 			for _, sm := range candidates {
-				dir := filepath.Join(blocksDir, sm.Dir)
-				b, err := readBlock(dir)
+				refs, err := s.blockRefsForStream(blocksDir, sm)
 				if err != nil {
 					return nil, err
 				}
-				if !b.overlaps(q.Start, q.End) {
-					continue
-				}
-				for i := 0; i < b.rows(); i++ {
-					e := b.row(i)
-					if !q.Start.IsZero() && e.Time.Before(q.Start) {
-						continue
+				refs = filterBlockRefs(refs, q.Start, q.End)
+				for _, ref := range refs {
+					// Only now open columnar files for blocks that survived time prune.
+					dir := filepath.Join(partDir, ref.Path)
+					b, err := readBlock(dir)
+					if err != nil {
+						return nil, err
 					}
-					if !q.End.IsZero() && e.Time.After(q.End) {
-						continue
-					}
-					if q.Contains != "" && !strings.Contains(e.Msg(), q.Contains) {
-						continue
-					}
-					out = append(out, e)
-					if q.Limit > 0 && len(out) >= q.Limit {
-						return out, nil
+					for i := 0; i < b.rows(); i++ {
+						e := b.row(i)
+						if !q.Start.IsZero() && e.Time.Before(q.Start) {
+							continue
+						}
+						if !q.End.IsZero() && e.Time.After(q.End) {
+							continue
+						}
+						if q.Contains != "" && !strings.Contains(e.Msg(), q.Contains) {
+							continue
+						}
+						out = append(out, e)
+						if q.Limit > 0 && len(out) >= q.Limit {
+							return out, nil
+						}
 					}
 				}
 			}
@@ -322,6 +332,29 @@ func (s *Storage) streamsForPart(partDir string, streamEq map[string]string) (ma
 		out[id] = streamMeta{ID: id, Dir: bd.Name(), Tags: ParseStreamTags(id)}
 	}
 	return out, nil
+}
+
+// blockRefsForStream returns block path/time refs from part index, or peeks block meta.json only.
+func (s *Storage) blockRefsForStream(blocksDir string, sm streamMeta) ([]blockRef, error) {
+	if len(sm.Blocks) > 0 {
+		return sm.Blocks, nil
+	}
+	// Legacy parts without blocks[]: read meta.json only (still no .col files).
+	dirName := sm.Dir
+	if dirName == "" {
+		dirName = safeStreamDir(sm.ID)
+	}
+	abs := filepath.Join(blocksDir, dirName)
+	bm, err := readBlockMeta(abs)
+	if err != nil {
+		return nil, err
+	}
+	return []blockRef{{
+		Path:      filepath.Join("blocks", dirName),
+		TimeMinNS: bm.TimeMinNS,
+		TimeMaxNS: bm.TimeMaxNS,
+		Rows:      bm.Rows,
+	}}, nil
 }
 
 func (s *Storage) listPartitions(start, end time.Time) ([]string, error) {
