@@ -55,7 +55,7 @@ type Storage struct {
 	root string
 	opts Options
 
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	buffers map[string]*memBlock // key: partition+"\x00"+stream
 	partSeq map[string]int       // next part id per partition
 }
@@ -294,30 +294,24 @@ func (s *Storage) Close() error {
 	return s.Flush()
 }
 
-// Search runs: in-memory parts + on-disk parts.
-// Buffered rows are visible immediately via inmemoryPart snapshots; Flush is not required.
-// Mem snapshot and the set of published disk parts are captured under one lock so a concurrent
-// Flush cannot make the same rows appear twice (once from mem, once from the newly published part).
+// Search runs: in-memory buffers (under RLock, no clone) + on-disk parts.
+// Buffered rows are visible immediately; Flush is not required for queryability.
+// See QUERY_CONCURRENCY.md for alternative designs (prune-then-clone, generational COW).
 func (s *Storage) Search(q Query) ([]Entry, error) {
-	s.mu.Lock()
-	memParts := s.snapshotInmemoryLocked()
+	s.mu.RLock()
+	out := s.searchBuffersRLocked(q, nil)
+	if q.Limit > 0 && len(out) >= q.Limit {
+		s.mu.RUnlock()
+		return out[:q.Limit], nil
+	}
 	diskParts, err := s.listPublishedPartsLocked(q.Start, q.End)
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
 
-	partitions := mergePartitionNames(keysOf(diskParts), memParts, q.Start, q.End)
-
-	var out []Entry
-	for _, partName := range partitions {
-		if ip := memParts[partName]; ip != nil {
-			out = searchInmemoryPart(ip, q, out)
-			if q.Limit > 0 && len(out) >= q.Limit {
-				return out[:q.Limit], nil
-			}
-		}
-
+	partNames := keysOf(diskParts)
+	for _, partName := range partNames {
 		for _, peName := range diskParts[partName] {
 			partDir := filepath.Join(s.root, "partitions", partName, "parts", peName)
 			candidates, err := s.streamsForPart(partDir, q.StreamEq)
@@ -364,7 +358,7 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 }
 
 // listPublishedPartsLocked returns partition → published part dir names.
-// Caller must hold s.mu (pairs with mem snapshot for a consistent Search view).
+// Caller must hold s.mu for read or write (pairs with in-memory scan for a consistent view).
 func (s *Storage) listPublishedPartsLocked(start, end time.Time) (map[string][]string, error) {
 	days, err := s.listPartitions(start, end)
 	if err != nil {

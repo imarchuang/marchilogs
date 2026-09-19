@@ -22,7 +22,8 @@ func main() {
 	addr := flag.String("addr", envOr("MARCHILOGS_ADDR", ":8080"), "listen address")
 	dataDir := flag.String("storageDataPath", envOr("MARCHILOGS_DATA", "/data"), "storage root directory")
 	streamFields := flag.String("streamFields", envOr("MARCHILOGS_STREAM_FIELDS", "service,host"), "comma-separated stream fields")
-	maxRows := flag.Int("maxRowsPerBlock", 1024, "flush block after this many rows")
+	maxRows := flag.Int("maxRowsPerBlock", 1024, "flush a stream block after this many rows")
+	flushInterval := flag.Duration("flushInterval", envDurationOr("MARCHILOGS_FLUSH_INTERVAL", 5*time.Second), "periodic disk flush interval; 0 disables")
 	flag.Parse()
 
 	fields := splitCSV(*streamFields)
@@ -35,12 +36,19 @@ func main() {
 	}
 	defer store.Close()
 
+	stopFlush := make(chan struct{})
+	if *flushInterval > 0 {
+		go runPeriodicFlush(store, *flushInterval, stopFlush)
+		log.Printf("periodic flush every %s", *flushInterval)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("/insert", handleInsert(store))
+	mux.HandleFunc("/flush", handleFlush(store))
 	mux.HandleFunc("/query", handleQuery(store, fields))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -48,7 +56,12 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = io.WriteString(w, "marchilogs\n\nPOST /insert  — JSON object, JSON array, or NDJSON\nGET  /query   — start,end,contains,limit + stream field equals\nGET  /healthz\n")
+		_, _ = io.WriteString(w, "marchilogs\n\n"+
+			"POST /insert           — Append only (queryable via inmemoryPart)\n"+
+			"POST /insert?flush=1   — Append then flush to disk\n"+
+			"POST /flush            — Flush buffered rows to disk\n"+
+			"GET  /query            — start,end,contains,limit + stream field equals\n"+
+			"GET  /healthz\n")
 	})
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
@@ -63,8 +76,24 @@ func main() {
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
 	log.Printf("shutting down…")
+	close(stopFlush)
 	_ = store.Flush()
 	_ = srv.Close()
+}
+
+func runPeriodicFlush(store *storage.Storage, every time.Duration, stop <-chan struct{}) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if err := store.Flush(); err != nil {
+				log.Printf("periodic flush: %v", err)
+			}
+		case <-stop:
+			return
+		}
+	}
 }
 
 func handleInsert(store *storage.Storage) http.HandlerFunc {
@@ -86,13 +115,46 @@ func handleInsert(store *storage.Storage) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// flush so queries see data immediately (fine for demo/testing)
+
+		flushed := false
+		if wantFlush(r) {
+			if err := store.Flush(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			flushed = true
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"inserted": len(entries),
+			"flushed":  flushed,
+		})
+	}
+}
+
+func handleFlush(store *storage.Storage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
 		if err := store.Flush(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"inserted": len(entries)})
+		_ = json.NewEncoder(w).Encode(map[string]any{"flushed": true})
+	}
+}
+
+func wantFlush(r *http.Request) bool {
+	v := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("flush")))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -259,4 +321,16 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envDurationOr(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
 }
