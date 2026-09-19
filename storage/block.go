@@ -22,6 +22,7 @@ type blockMeta struct {
 type memBlock struct {
 	stream  string
 	times   []int64
+	seqs    []uint64            // WAL seq per row; 0 if WAL disabled
 	fields  map[string][]string // columnar in-memory
 	timeMin int64
 	timeMax int64
@@ -39,8 +40,13 @@ func newMemBlock(stream string) *memBlock {
 func (b *memBlock) rows() int { return len(b.times) }
 
 func (b *memBlock) add(e Entry) {
+	b.addWithSeq(e, 0)
+}
+
+func (b *memBlock) addWithSeq(e Entry, seq uint64) {
 	ts := e.Time.UnixNano()
 	b.times = append(b.times, ts)
+	b.seqs = append(b.seqs, seq)
 	if b.rows() == 1 {
 		b.timeMin, b.timeMax = ts, ts
 	} else {

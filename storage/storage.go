@@ -19,6 +19,20 @@ type Options struct {
 
 	// MaxRowsPerBlock flushes a stream block when it reaches this many rows.
 	MaxRowsPerBlock int
+
+	// InmemoryDataFlushInterval is how often buffered data is flushed to disk parts
+	// so it survives unclean shutdown (VictoriaLogs-style durability window).
+	// Default 5s; values in (0, 1s) are raised to 1s. Set to a negative duration to disable.
+	InmemoryDataFlushInterval time.Duration
+
+	// EnableWAL turns on the write-ahead log for unflushed buffers (default off).
+	// When disabled, unclean shutdown can lose data not yet Flush()'d to parts
+	// (bounded by InmemoryDataFlushInterval when periodic flush is enabled).
+	EnableWAL bool
+
+	// WALSync fsyncs the WAL after each Append batch (default true when WAL enabled).
+	// Set false for faster ingest with softer durability (OS buffer).
+	WALSync *bool
 }
 
 func (o *Options) withDefaults() Options {
@@ -28,6 +42,15 @@ func (o *Options) withDefaults() Options {
 	}
 	if out.MaxRowsPerBlock <= 0 {
 		out.MaxRowsPerBlock = 1024
+	}
+	if out.InmemoryDataFlushInterval == 0 {
+		out.InmemoryDataFlushInterval = 5 * time.Second
+	} else if out.InmemoryDataFlushInterval > 0 && out.InmemoryDataFlushInterval < time.Second {
+		out.InmemoryDataFlushInterval = time.Second
+	}
+	if out.WALSync == nil {
+		v := true
+		out.WALSync = &v
 	}
 	return out
 }
@@ -51,6 +74,7 @@ type Query struct {
 // Storage is the most basic marchilogs store:
 //
 //	data/partitions/YYYYMMDD/parts/<id>/blocks/<stream>/...
+//	data/wal/wal.log + checkpoint   (optional; EnableWAL)
 type Storage struct {
 	root string
 	opts Options
@@ -58,6 +82,10 @@ type Storage struct {
 	mu      sync.RWMutex
 	buffers map[string]*memBlock // key: partition+"\x00"+stream
 	partSeq map[string]int       // next part id per partition
+	wal     *wal
+
+	flushStop chan struct{}
+	flushDone chan struct{}
 }
 
 // Open creates or opens a storage rooted at dir.
@@ -78,7 +106,56 @@ func Open(dir string, opts Options) (*Storage, error) {
 	if err := s.loadPartSeq(); err != nil {
 		return nil, err
 	}
+	if opts.EnableWAL {
+		w, err := openWAL(dir, *opts.WALSync)
+		if err != nil {
+			return nil, err
+		}
+		s.wal = w
+		if err := s.replayWAL(); err != nil {
+			_ = w.close()
+			return nil, err
+		}
+	}
+	s.startPeriodicFlush()
 	return s, nil
+}
+
+func (s *Storage) startPeriodicFlush() {
+	every := s.opts.InmemoryDataFlushInterval
+	if every <= 0 {
+		return
+	}
+	s.flushStop = make(chan struct{})
+	s.flushDone = make(chan struct{})
+	go func() {
+		defer close(s.flushDone)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				_ = s.Flush()
+			case <-s.flushStop:
+				return
+			}
+		}
+	}()
+}
+
+func (s *Storage) replayWAL() error {
+	if s.wal == nil {
+		return nil
+	}
+	return s.wal.replayAfterCheckpoint(func(rec walRecord) error {
+		e := Entry{
+			Time:   time.Unix(0, rec.TimeNS).UTC(),
+			Fields: rec.Fields,
+		}
+		e = e.normalize(s.opts.StreamFields)
+		s.applyLocked(e, rec.Seq)
+		return nil
+	})
 }
 
 // publishingPrefix marks in-progress part directories. Readers must ignore them;
@@ -167,27 +244,53 @@ func bufKey(partition, stream string) string {
 }
 
 // Append adds log entries into in-memory stream blocks (flushes when full).
+// With WAL enabled, records are fsynced to wal.log before becoming queryable in buffers.
 func (s *Storage) Append(entries ...Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	normalized := make([]Entry, 0, len(entries))
+	for _, raw := range entries {
+		normalized = append(normalized, raw.normalize(s.opts.StreamFields))
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, raw := range entries {
-		e := raw.normalize(s.opts.StreamFields)
-		part := partitionName(e.Time)
-		stream := e.Fields[FieldStream]
-		key := bufKey(part, stream)
-		b := s.buffers[key]
-		if b == nil {
-			b = newMemBlock(stream)
-			s.buffers[key] = b
+
+	var seqs []uint64
+	if s.wal != nil {
+		var err error
+		seqs, err = s.wal.appendEntries(normalized)
+		if err != nil {
+			return err
 		}
-		b.add(e)
-		if b.rows() >= s.opts.MaxRowsPerBlock {
+	} else {
+		seqs = make([]uint64, len(normalized))
+	}
+
+	for i, e := range normalized {
+		part := partitionName(e.Time)
+		s.applyLocked(e, seqs[i])
+		key := bufKey(part, e.Fields[FieldStream])
+		if b := s.buffers[key]; b != nil && b.rows() >= s.opts.MaxRowsPerBlock {
 			if err := s.flushPartitionLocked(part); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func (s *Storage) applyLocked(e Entry, seq uint64) {
+	part := partitionName(e.Time)
+	stream := e.Fields[FieldStream]
+	key := bufKey(part, stream)
+	b := s.buffers[key]
+	if b == nil {
+		b = newMemBlock(stream)
+		s.buffers[key] = b
+	}
+	b.addWithSeq(e, seq)
 }
 
 // Flush writes all in-memory blocks to disk as one new part per partition touched.
@@ -283,15 +386,69 @@ func (s *Storage) flushPartitionLocked(partition string) error {
 		return fmt.Errorf("publish part %s: %w", finalName, err)
 	}
 
+	removed := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		removed[it.key] = struct{}{}
+	}
+	// Persist WAL checkpoint before dropping buffers so a crash cannot replay
+	// already-published rows back into memory (duplicate with disk parts).
+	if err := s.advanceWALCheckpointLocked(removed); err != nil {
+		return err
+	}
 	for _, it := range items {
 		delete(s.buffers, it.key)
+	}
+	if s.wal != nil {
+		return s.wal.compactLocked()
 	}
 	return nil
 }
 
-// Close flushes and releases the storage.
+// advanceWALCheckpointLocked sets checkpoint to min(unflushedSeq)-1, treating
+// removedKeys as already gone from buffers. Caller holds write lock.
+func (s *Storage) advanceWALCheckpointLocked(removedKeys map[string]struct{}) error {
+	if s.wal == nil {
+		return nil
+	}
+	minUnflushed := s.wal.nextSeq
+	for key, b := range s.buffers {
+		if _, skip := removedKeys[key]; skip {
+			continue
+		}
+		for _, seq := range b.seqs {
+			if seq > 0 && seq < minUnflushed {
+				minUnflushed = seq
+			}
+		}
+	}
+	var newCP uint64
+	if minUnflushed == 0 {
+		newCP = 0
+	} else {
+		newCP = minUnflushed - 1
+	}
+	return s.wal.setCheckpoint(newCP)
+}
+
+// Close stops periodic flush, flushes buffers to parts, checkpoints WAL, and closes the WAL file.
 func (s *Storage) Close() error {
-	return s.Flush()
+	if s.flushStop != nil {
+		close(s.flushStop)
+		<-s.flushDone
+		s.flushStop = nil
+	}
+	flushErr := s.Flush()
+	s.mu.Lock()
+	var closeErr error
+	if s.wal != nil {
+		closeErr = s.wal.close()
+		s.wal = nil
+	}
+	s.mu.Unlock()
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
 }
 
 // Search runs: in-memory buffers (under RLock, no clone) + on-disk parts.

@@ -15,7 +15,7 @@ import (
 //	host=h1,service=api2          (no cluster)
 func TestComplexStreamQueryScenarios(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{
+	s, err := openTest(dir, Options{
 		StreamFields:    []string{"host", "service", "cluster"},
 		MaxRowsPerBlock: 64,
 	})

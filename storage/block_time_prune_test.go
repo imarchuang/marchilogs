@@ -34,7 +34,7 @@ func TestFilterBlockRefsByTime(t *testing.T) {
 
 func TestSearchPrunesBlockBeforeColumnRead(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{StreamFields: []string{"service", "host"}})
+	s, err := openTest(dir, Options{StreamFields: []string{"service", "host"}})
 	if err != nil {
 		t.Fatal(err)
 	}
