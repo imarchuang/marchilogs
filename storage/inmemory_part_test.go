@@ -9,7 +9,7 @@ import (
 
 func TestSearchSeesInmemoryWithoutFlush(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{
+	s, err := openTest(dir, Options{
 		StreamFields:    []string{"service", "host"},
 		MaxRowsPerBlock: 1000, // avoid auto-flush
 	})
@@ -55,7 +55,7 @@ func TestSearchSeesInmemoryWithoutFlush(t *testing.T) {
 
 func TestSearchMergesInmemoryAndDisk(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{
+	s, err := openTest(dir, Options{
 		StreamFields:    []string{"service", "host"},
 		MaxRowsPerBlock: 1000,
 	})
@@ -95,7 +95,7 @@ func TestSearchMergesInmemoryAndDisk(t *testing.T) {
 
 func TestInmemoryStreamSubsetAndTimePrune(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{
+	s, err := openTest(dir, Options{
 		StreamFields:    []string{"service", "host", "cluster"},
 		MaxRowsPerBlock: 1000,
 	})

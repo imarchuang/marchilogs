@@ -17,8 +17,9 @@ import (
 func TestInsertDefaultDoesNotFlush(t *testing.T) {
 	dir := t.TempDir()
 	store, err := storage.Open(dir, storage.Options{
-		StreamFields:    []string{"service", "host"},
-		MaxRowsPerBlock: 1000,
+		StreamFields:              []string{"service", "host"},
+		MaxRowsPerBlock:           1000,
+		InmemoryDataFlushInterval: -1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -63,8 +64,9 @@ func TestInsertDefaultDoesNotFlush(t *testing.T) {
 func TestInsertFlushQueryParamAndEndpoint(t *testing.T) {
 	dir := t.TempDir()
 	store, err := storage.Open(dir, storage.Options{
-		StreamFields:    []string{"service"},
-		MaxRowsPerBlock: 1000,
+		StreamFields:              []string{"service"},
+		MaxRowsPerBlock:           1000,
+		InmemoryDataFlushInterval: -1,
 	})
 	if err != nil {
 		t.Fatal(err)

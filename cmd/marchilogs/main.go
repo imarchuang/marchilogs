@@ -23,23 +23,28 @@ func main() {
 	dataDir := flag.String("storageDataPath", envOr("MARCHILOGS_DATA", "/data"), "storage root directory")
 	streamFields := flag.String("streamFields", envOr("MARCHILOGS_STREAM_FIELDS", "service,host"), "comma-separated stream fields")
 	maxRows := flag.Int("maxRowsPerBlock", 1024, "flush a stream block after this many rows")
-	flushInterval := flag.Duration("flushInterval", envDurationOr("MARCHILOGS_FLUSH_INTERVAL", 5*time.Second), "periodic disk flush interval; 0 disables")
+	flushInterval := flag.Duration("inmemoryDataFlushInterval",
+		envDurationOr("MARCHILOGS_INMEMORY_DATA_FLUSH_INTERVAL", 5*time.Second),
+		"interval for guaranteed flush of in-memory data to disk (VictoriaLogs-style); min 1s; 0 disables")
 	flag.Parse()
 
 	fields := splitCSV(*streamFields)
+	interval := *flushInterval
+	if interval == 0 {
+		interval = -1 // disable periodic flush in storage
+	}
 	store, err := storage.Open(*dataDir, storage.Options{
-		StreamFields:    fields,
-		MaxRowsPerBlock: *maxRows,
+		StreamFields:              fields,
+		MaxRowsPerBlock:           *maxRows,
+		InmemoryDataFlushInterval: interval,
 	})
 	if err != nil {
 		log.Fatalf("open storage: %v", err)
 	}
 	defer store.Close()
 
-	stopFlush := make(chan struct{})
-	if *flushInterval > 0 {
-		go runPeriodicFlush(store, *flushInterval, stopFlush)
-		log.Printf("periodic flush every %s", *flushInterval)
+	if interval > 0 {
+		log.Printf("inmemory data flush interval %s (min enforced at 1s)", interval)
 	}
 
 	mux := http.NewServeMux()
@@ -57,11 +62,12 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, "marchilogs\n\n"+
-			"POST /insert           — Append only (queryable via inmemoryPart)\n"+
+			"POST /insert           — Append only (queryable from memory)\n"+
 			"POST /insert?flush=1   — Append then flush to disk\n"+
 			"POST /flush            — Flush buffered rows to disk\n"+
 			"GET  /query            — start,end,contains,limit + stream field equals\n"+
-			"GET  /healthz\n")
+			"GET  /healthz\n"+
+			"\nDurability: in-memory buffers flush to disk every -inmemoryDataFlushInterval (default 5s).\n")
 	})
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
@@ -76,24 +82,8 @@ func main() {
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
 	log.Printf("shutting down…")
-	close(stopFlush)
 	_ = store.Flush()
 	_ = srv.Close()
-}
-
-func runPeriodicFlush(store *storage.Storage, every time.Duration, stop <-chan struct{}) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			if err := store.Flush(); err != nil {
-				log.Printf("periodic flush: %v", err)
-			}
-		case <-stop:
-			return
-		}
-	}
 }
 
 func handleInsert(store *storage.Storage) http.HandlerFunc {
@@ -237,7 +227,6 @@ func decodeEntries(r io.Reader) ([]storage.Entry, error) {
 		}
 		return out, nil
 	}
-	// single object or NDJSON
 	var out []storage.Entry
 	dec := json.NewDecoder(br)
 	for {
@@ -271,7 +260,6 @@ func mapToEntry(m map[string]any) (storage.Entry, error) {
 				}
 				t = parsed
 			case float64:
-				// unix seconds
 				t = time.Unix(int64(x), 0).UTC()
 			default:
 				return storage.Entry{}, fmt.Errorf("unsupported _time type %T", v)
@@ -295,7 +283,6 @@ func parseTimeParam(s string) (time.Time, error) {
 		return t.UTC(), nil
 	}
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-		// treat as unix seconds if small, else nanos
 		if n < 1e12 {
 			return time.Unix(n, 0).UTC(), nil
 		}

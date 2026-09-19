@@ -8,7 +8,7 @@ import (
 
 func TestAppendSearchPrune(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{
+	s, err := openTest(dir, Options{
 		StreamFields:    []string{"service", "host"},
 		MaxRowsPerBlock: 2,
 	})
@@ -94,7 +94,7 @@ func TestStreamIDStable(t *testing.T) {
 
 func TestStreamSubsetMatch(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{StreamFields: []string{"service", "host"}})
+	s, err := openTest(dir, Options{StreamFields: []string{"service", "host"}})
 	if err != nil {
 		t.Fatal(err)
 	}

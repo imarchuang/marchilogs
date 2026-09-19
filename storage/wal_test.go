@@ -7,7 +7,7 @@ import (
 
 func TestWALSurvivesCrashWithoutFlush(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{
+	s, err := openTest(dir, Options{
 		EnableWAL:       true,
 		StreamFields:    []string{"service", "host"},
 		MaxRowsPerBlock: 1000,
@@ -30,7 +30,7 @@ func TestWALSurvivesCrashWithoutFlush(t *testing.T) {
 	s.buffers = nil // drop memory
 	s.mu.Unlock()
 
-	s2, err := Open(dir, Options{
+	s2, err := openTest(dir, Options{
 		EnableWAL:       true,
 		StreamFields:    []string{"service", "host"},
 		MaxRowsPerBlock: 1000,
@@ -51,7 +51,7 @@ func TestWALSurvivesCrashWithoutFlush(t *testing.T) {
 
 func TestWALCheckpointAvoidsDuplicateAfterFlush(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{
+	s, err := openTest(dir, Options{
 		EnableWAL:       true,
 		StreamFields:    []string{"service"},
 		MaxRowsPerBlock: 1000,
@@ -74,7 +74,7 @@ func TestWALCheckpointAvoidsDuplicateAfterFlush(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(dir, Options{
+	s2, err := openTest(dir, Options{
 		EnableWAL:       true,
 		StreamFields:    []string{"service"},
 		MaxRowsPerBlock: 1000,
@@ -95,7 +95,7 @@ func TestWALCheckpointAvoidsDuplicateAfterFlush(t *testing.T) {
 
 func TestWALPartialFlushCheckpoint(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{
+	s, err := openTest(dir, Options{
 		EnableWAL:       true,
 		StreamFields:    []string{"service"},
 		MaxRowsPerBlock: 1000,
@@ -127,7 +127,7 @@ func TestWALPartialFlushCheckpoint(t *testing.T) {
 	s.buffers = make(map[string]*memBlock)
 	s.mu.Unlock()
 
-	s2, err := Open(dir, Options{EnableWAL: true, StreamFields: []string{"service"}, MaxRowsPerBlock: 1000})
+	s2, err := openTest(dir, Options{EnableWAL: true, StreamFields: []string{"service"}, MaxRowsPerBlock: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestWALPartialFlushCheckpoint(t *testing.T) {
 
 func TestWALDisabledByDefault(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, Options{StreamFields: []string{"service"}})
+	s, err := openTest(dir, Options{StreamFields: []string{"service"}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,7 @@
 # WAL durability
 
-Unflushed buffers are protected by a write-ahead log under `data/wal/`.
+Unflushed buffers are optionally protected by a write-ahead log under `data/wal/`.
+**WAL is off by default.** Prefer the [durability window](DURABILITY.md) (`InmemoryDataFlushInterval`, default 5s).
 
 ## Layout
 
