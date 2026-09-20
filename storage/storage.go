@@ -48,6 +48,14 @@ type Options struct {
 	// MergeDisable turns off the background merge worker only.
 	// Manual runMergePass still works (tests / force-merge later).
 	MergeDisable bool
+
+	// RetentionPeriod drops whole day partitions once the day's end is older than now−period.
+	// ≤0 disables retention (default).
+	RetentionPeriod time.Duration
+
+	// RetentionCheckInterval is how often the background worker runs ApplyRetention.
+	// Default 1h when RetentionPeriod > 0; ≤0 disables the worker (ApplyRetention still works).
+	RetentionCheckInterval time.Duration
 }
 
 func (o *Options) withDefaults() Options {
@@ -68,6 +76,7 @@ func (o *Options) withDefaults() Options {
 		out.WALSync = &v
 	}
 	out.withMergeDefaults()
+	out.withRetentionDefaults()
 	return out
 }
 
@@ -107,6 +116,9 @@ type Storage struct {
 
 	mergeStop chan struct{}
 	mergeDone chan struct{}
+
+	retentionStop chan struct{}
+	retentionDone chan struct{}
 }
 
 // Open creates or opens a storage rooted at dir.
@@ -144,6 +156,7 @@ func Open(dir string, opts Options) (*Storage, error) {
 	}
 	s.startPeriodicFlush()
 	s.startPeriodicMerge()
+	s.startPeriodicRetention()
 	return s, nil
 }
 
@@ -476,6 +489,7 @@ func (s *Storage) advanceWALCheckpointLocked(removedKeys map[string]struct{}) er
 
 // Close stops background workers, flushes buffers to parts, checkpoints WAL, and closes the WAL file.
 func (s *Storage) Close() error {
+	s.stopPeriodicRetention()
 	s.stopPeriodicMerge()
 	if s.flushStop != nil {
 		close(s.flushStop)
