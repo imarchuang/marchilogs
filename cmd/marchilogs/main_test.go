@@ -154,7 +154,46 @@ func countPublishedParts(root string) int {
 	return n
 }
 
-func TestForceMergeHTTP(t *testing.T) {
+func TestQueryStatsHeaders(t *testing.T) {
+	dir := t.TempDir()
+	store, err := storage.Open(dir, storage.Options{
+		StreamFields:              []string{"service"},
+		InmemoryDataFlushInterval: -1,
+		MergeCheckInterval:        -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/insert", handleInsert(store))
+	mux.HandleFunc("/query", handleQuery(store, []string{"service"}))
+
+	body := `{"_msg":"hello stats","service":"api"}`
+	req := httptest.NewRequest(http.MethodPost, "/insert?flush=1", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("insert: %s", rr.Body.String())
+	}
+
+	qreq := httptest.NewRequest(http.MethodGet, "/query?contains=hello&stats=1", nil)
+	qrr := httptest.NewRecorder()
+	mux.ServeHTTP(qrr, qreq)
+	if qrr.Code != http.StatusOK {
+		t.Fatalf("query: %s", qrr.Body.String())
+	}
+	if qrr.Header().Get("X-Marchilogs-Parts-Scanned") != "1" {
+		t.Fatalf("parts header=%q body=%s", qrr.Header().Get("X-Marchilogs-Parts-Scanned"), qrr.Body.String())
+	}
+	if qrr.Header().Get("X-Marchilogs-Blocks-Scanned") != "1" {
+		t.Fatalf("blocks header=%q", qrr.Header().Get("X-Marchilogs-Blocks-Scanned"))
+	}
+	if !strings.Contains(qrr.Body.String(), `"_stats"`) {
+		t.Fatalf("want _stats line, got %s", qrr.Body.String())
+	}
+}
 	dir := t.TempDir()
 	store, err := storage.Open(dir, storage.Options{
 		StreamFields:              []string{"service"},
