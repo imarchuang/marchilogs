@@ -546,6 +546,9 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 				refs = filterBlockRefs(refs, q.Start, q.End)
 				for _, ref := range refs {
 					dir := filepath.Join(partDir, ref.Path)
+					if q.Contains != "" && !blockMightContainMsg(dir, q.Contains) {
+						continue
+					}
 					b, err := readBlock(dir)
 					if err != nil {
 						return nil, err

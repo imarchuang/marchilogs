@@ -223,6 +223,11 @@ func (b *memBlock) writeTo(dir string) error {
 			return fmt.Errorf("write field %s: %w", k, err)
 		}
 	}
+	if msgs := b.fields[FieldMsg]; len(msgs) > 0 {
+		if err := writeMsgBloom(filepath.Join(dir, bloomFileName), msgs); err != nil {
+			return fmt.Errorf("write msg bloom: %w", err)
+		}
+	}
 	return nil
 }
 
