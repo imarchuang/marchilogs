@@ -96,6 +96,8 @@ func main() {
 			"POST /insert?flush=1   — Append then flush to disk\n"+
 			"POST /flush            — Flush buffered rows to disk\n"+
 			"GET  /query            — start,end,contains,limit + stream field equals\n"+
+			"                       add stats=1 for a trailing {_stats:...} NDJSON line\n"+
+			"                       (headers X-Marchilogs-*-Scanned always set)\n"+
 			"POST /internal/force_merge?day=YYYYMMDD — compact small parts now\n"+
 			"GET  /healthz\n"+
 			"\nDurability: in-memory buffers flush to disk every -inmemoryDataFlushInterval (default 5s).\n"+
@@ -229,7 +231,8 @@ func handleQuery(store *storage.Storage, streamFields []string) http.HandlerFunc
 				streamEq[f] = v
 			}
 		}
-		rows, err := store.Search(storage.Query{
+		wantStatsBody := wantTruthy(q.Get("stats"))
+		rows, st, err := store.SearchWithStats(storage.Query{
 			Start:    start,
 			End:      end,
 			StreamEq: streamEq,
@@ -240,6 +243,7 @@ func handleQuery(store *storage.Storage, streamFields []string) http.HandlerFunc
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		writeQueryStatsHeaders(w, st)
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		enc := json.NewEncoder(w)
 		for _, e := range rows {
@@ -252,6 +256,29 @@ func handleQuery(store *storage.Storage, streamFields []string) http.HandlerFunc
 				return
 			}
 		}
+		if wantStatsBody {
+			_ = enc.Encode(map[string]any{"_stats": st})
+		}
+	}
+}
+
+func writeQueryStatsHeaders(w http.ResponseWriter, st storage.QueryStats) {
+	h := w.Header()
+	h.Set("X-Marchilogs-Mem-Blocks-Scanned", strconv.Itoa(st.MemBlocksScanned))
+	h.Set("X-Marchilogs-Parts-Scanned", strconv.Itoa(st.PartsScanned))
+	h.Set("X-Marchilogs-Blocks-Seen", strconv.Itoa(st.BlocksSeen))
+	h.Set("X-Marchilogs-Blocks-Skipped-Bloom", strconv.Itoa(st.BlocksSkippedBloom))
+	h.Set("X-Marchilogs-Blocks-Scanned", strconv.Itoa(st.BlocksScanned))
+	h.Set("X-Marchilogs-Rows-Scanned", strconv.Itoa(st.RowsScanned))
+	h.Set("X-Marchilogs-Rows-Returned", strconv.Itoa(st.RowsReturned))
+}
+
+func wantTruthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -514,25 +514,34 @@ func (s *Storage) Close() error {
 // Buffered rows are visible immediately; Flush is not required for queryability.
 // See QUERY_CONCURRENCY.md for alternative designs (prune-then-clone, generational COW).
 func (s *Storage) Search(q Query) ([]Entry, error) {
+	rows, _, err := s.SearchWithStats(q)
+	return rows, err
+}
+
+// SearchWithStats is Search plus a breakdown of scanned parts/blocks/rows.
+func (s *Storage) SearchWithStats(q Query) ([]Entry, QueryStats, error) {
+	var st QueryStats
 	s.mu.RLock()
-	out := s.searchBuffersRLocked(q, nil)
+	out := s.searchBuffersRLocked(q, nil, &st)
 	if q.Limit > 0 && len(out) >= q.Limit {
 		s.mu.RUnlock()
-		return out[:q.Limit], nil
+		st.RowsReturned = len(out)
+		return out[:q.Limit], st, nil
 	}
 	diskParts, err := s.listPublishedPartsLocked(q.Start, q.End)
 	s.mu.RUnlock()
 	if err != nil {
-		return nil, err
+		return nil, st, err
 	}
 
 	partNames := keysOf(diskParts)
 	for _, partName := range partNames {
 		for _, peName := range diskParts[partName] {
+			st.PartsScanned++
 			partDir := filepath.Join(s.root, "partitions", partName, "parts", peName)
 			candidates, err := s.streamsForPart(partDir, q.StreamEq)
 			if err != nil {
-				return nil, err
+				return nil, st, err
 			}
 			if len(candidates) == 0 {
 				continue
@@ -541,19 +550,23 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 			for _, sm := range candidates {
 				refs, err := s.blockRefsForStream(blocksDir, sm)
 				if err != nil {
-					return nil, err
+					return nil, st, err
 				}
 				refs = filterBlockRefs(refs, q.Start, q.End)
 				for _, ref := range refs {
+					st.BlocksSeen++
 					dir := filepath.Join(partDir, ref.Path)
 					if q.Contains != "" && !blockMightContainMsg(dir, q.Contains) {
+						st.BlocksSkippedBloom++
 						continue
 					}
 					b, err := readBlock(dir)
 					if err != nil {
-						return nil, err
+						return nil, st, err
 					}
+					st.BlocksScanned++
 					for i := 0; i < b.rows(); i++ {
+						st.RowsScanned++
 						e := b.row(i)
 						if !q.Start.IsZero() && e.Time.Before(q.Start) {
 							continue
@@ -566,14 +579,16 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 						}
 						out = append(out, e)
 						if q.Limit > 0 && len(out) >= q.Limit {
-							return out, nil
+							st.RowsReturned = len(out)
+							return out, st, nil
 						}
 					}
 				}
 			}
 		}
 	}
-	return out, nil
+	st.RowsReturned = len(out)
+	return out, st, nil
 }
 
 // listPublishedPartsLocked returns partition → active part dir names from manifests.
