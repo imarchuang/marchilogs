@@ -103,3 +103,51 @@ func TestCompactionSkipsWhenBelowMinParts(t *testing.T) {
 		t.Fatalf("want still 2 parts, got %v", ids)
 	}
 }
+
+func TestForceMergeIgnoresMinParts(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openTest(dir, Options{
+		StreamFields:  []string{"service"},
+		MergeMinParts: 8, // background would not merge 2 parts
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Date(2026, 3, 19, 14, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		_ = s.Append(Entry{Time: now, Fields: map[string]string{"_msg": fmt.Sprintf("f-%d", i), "service": "api"}})
+		_ = s.Flush()
+	}
+
+	if err := s.ForceMerge("20260319"); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.RLock()
+	ids := append([]string(nil), s.manifests["20260319"]...)
+	s.mu.RUnlock()
+	if len(ids) != 1 {
+		t.Fatalf("force merge want 1 part, got %v", ids)
+	}
+
+	got, err := s.Search(Query{Contains: "f-"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 rows, got %#v", got)
+	}
+}
+
+func TestForceMergeRejectsBadDay(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openTest(dir, Options{StreamFields: []string{"service"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.ForceMerge("not-a-day"); err == nil {
+		t.Fatal("want error for bad day")
+	}
+}

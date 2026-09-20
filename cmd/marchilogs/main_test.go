@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -151,4 +152,47 @@ func countPublishedParts(root string) int {
 		return nil
 	})
 	return n
+}
+
+func TestForceMergeHTTP(t *testing.T) {
+	dir := t.TempDir()
+	store, err := storage.Open(dir, storage.Options{
+		StreamFields:              []string{"service"},
+		MaxRowsPerBlock:           1000,
+		InmemoryDataFlushInterval: -1,
+		MergeCheckInterval:        -1,
+		MergeMinParts:             8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/insert", handleInsert(store))
+	mux.HandleFunc("/internal/force_merge", handleForceMerge(store))
+
+	now := time.Date(2026, 3, 19, 15, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		body := fmt.Sprintf(`{"_msg":"m-%d","service":"api","_time":"%s"}`, i, now.Format(time.RFC3339Nano))
+		req := httptest.NewRequest(http.MethodPost, "/insert?flush=1", strings.NewReader(body))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("insert: %d %s", rr.Code, rr.Body.String())
+		}
+	}
+	if got := countPublishedParts(dir); got != 2 {
+		t.Fatalf("parts before merge: %d", got)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/force_merge?day=20260319", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("force_merge: %d %s", rr.Code, rr.Body.String())
+	}
+	if got := countPublishedParts(dir); got != 1 {
+		t.Fatalf("parts after force_merge: %d", got)
+	}
 }

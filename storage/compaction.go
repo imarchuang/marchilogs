@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,7 +37,9 @@ func (s *Storage) startPeriodicMerge() {
 		for {
 			select {
 			case <-t.C:
-				_ = s.runMergePass()
+				if err := s.runMergePass(); err != nil {
+					log.Printf("merge: %v", err)
+				}
 			case <-s.mergeStop:
 				return
 			}
@@ -74,13 +77,33 @@ func (s *Storage) runMergePass() error {
 	return nil
 }
 
+// ForceMerge runs compaction now.
+// If day is empty, performs one global merge pass (same as the background worker).
+// If day is set, merges that day's small parts when there are at least 2 (ignores MergeMinParts).
+func (s *Storage) ForceMerge(day string) error {
+	if day == "" {
+		return s.runMergePass()
+	}
+	if _, err := parsePartitionName(day); err != nil {
+		return fmt.Errorf("force merge: %w", err)
+	}
+	_, err := s.mergeDayIfNeeded(day, 2)
+	return err
+}
+
 // tryMergeDay merges oldest small parts when count >= MergeMinParts.
-// Returns true if a merge ran.
 func (s *Storage) tryMergeDay(day string) (bool, error) {
+	return s.mergeDayIfNeeded(day, s.opts.MergeMinParts)
+}
+
+func (s *Storage) mergeDayIfNeeded(day string, minParts int) (bool, error) {
+	if minParts < 2 {
+		minParts = 2
+	}
 	s.mu.RLock()
 	ids := append([]string(nil), s.manifests[day]...)
 	s.mu.RUnlock()
-	if len(ids) < s.opts.MergeMinParts {
+	if len(ids) < minParts {
 		return false, nil
 	}
 
@@ -88,7 +111,7 @@ func (s *Storage) tryMergeDay(day string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if len(small) < s.opts.MergeMinParts {
+	if len(small) < minParts {
 		return false, nil
 	}
 	n := s.opts.MergeMaxPartsPerJob
@@ -97,6 +120,7 @@ func (s *Storage) tryMergeDay(day string) (bool, error) {
 	}
 	inputs := small[:n]
 	if err := s.mergeParts(day, inputs); err != nil {
+		log.Printf("merge day=%s inputs=%v failed: %v", day, inputs, err)
 		return false, err
 	}
 	return true, nil
@@ -135,6 +159,7 @@ func (s *Storage) mergeParts(day string, inputs []string) error {
 	if len(inputs) == 0 {
 		return nil
 	}
+	start := time.Now()
 	partsParent := filepath.Join(s.root, "partitions", day, "parts")
 	if err := os.MkdirAll(partsParent, 0o755); err != nil {
 		return err
@@ -166,7 +191,8 @@ func (s *Storage) mergeParts(day string, inputs []string) error {
 		_ = os.RemoveAll(finalDir)
 	}
 
-	if err := s.writeMergedPart(day, inputs, tmpDir); err != nil {
+	rows, err := s.writeMergedPart(day, inputs, tmpDir)
+	if err != nil {
 		rollbackSeq()
 		return err
 	}
@@ -195,6 +221,8 @@ func (s *Storage) mergeParts(day string, inputs []string) error {
 	for _, id := range inputs {
 		_ = os.RemoveAll(filepath.Join(partsParent, id))
 	}
+	log.Printf("merge day=%s inputs=%v -> %s rows=%d took=%s",
+		day, inputs, finalName, rows, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -210,10 +238,10 @@ func rollbackSeqUnlocked(s *Storage, day string, outID int, tmpDir, finalDir str
 	}
 }
 
-func (s *Storage) writeMergedPart(day string, inputs []string, outDir string) error {
+func (s *Storage) writeMergedPart(day string, inputs []string, outDir string) (int, error) {
 	blocksDir := filepath.Join(outDir, "blocks")
 	if err := os.MkdirAll(blocksDir, 0o755); err != nil {
-		return err
+		return 0, err
 	}
 
 	// stream id → concatenated memBlock (inputs already oldest-first)
@@ -224,7 +252,7 @@ func (s *Storage) writeMergedPart(day string, inputs []string, outDir string) er
 		partDir := filepath.Join(s.root, "partitions", day, "parts", id)
 		var meta partMeta
 		if err := readJSON(filepath.Join(partDir, "meta.json"), &meta); err != nil {
-			return err
+			return 0, err
 		}
 		// Stable order within part: use Streams order from meta.
 		for _, sm := range meta.Streams {
@@ -245,7 +273,7 @@ func (s *Storage) writeMergedPart(day string, inputs []string, outDir string) er
 			for _, ref := range refs {
 				b, err := readBlock(filepath.Join(partDir, ref.Path))
 				if err != nil {
-					return fmt.Errorf("read %s/%s: %w", id, sm.ID, err)
+					return 0, fmt.Errorf("read %s/%s: %w", id, sm.ID, err)
 				}
 				for i := 0; i < b.rows(); i++ {
 					dst.add(b.row(i))
@@ -257,11 +285,12 @@ func (s *Storage) writeMergedPart(day string, inputs []string, outDir string) er
 	infos := make([]streamFlushInfo, 0, len(streamOrder))
 	var tMin, tMax int64
 	first := true
+	totalRows := 0
 	for _, sid := range streamOrder {
 		b := byStream[sid]
 		dir := filepath.Join(blocksDir, safeStreamDir(sid))
 		if err := b.writeTo(dir); err != nil {
-			return err
+			return 0, err
 		}
 		infos = append(infos, streamFlushInfo{
 			ID:        sid,
@@ -269,6 +298,7 @@ func (s *Storage) writeMergedPart(day string, inputs []string, outDir string) er
 			TimeMaxNS: b.timeMax,
 			Rows:      b.rows(),
 		})
+		totalRows += b.rows()
 		if first {
 			tMin, tMax = b.timeMin, b.timeMax
 			first = false
@@ -284,7 +314,10 @@ func (s *Storage) writeMergedPart(day string, inputs []string, outDir string) er
 
 	meta := buildPartMeta(infos, tMin, tMax)
 	meta.Tier = partTierBig
-	return writeJSON(filepath.Join(outDir, "meta.json"), meta)
+	if err := writeJSON(filepath.Join(outDir, "meta.json"), meta); err != nil {
+		return 0, err
+	}
+	return totalRows, nil
 }
 
 func containsString(ss []string, want string) bool {
