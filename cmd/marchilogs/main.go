@@ -266,6 +266,7 @@ func writeQueryStatsHeaders(w http.ResponseWriter, st storage.QueryStats) {
 	h := w.Header()
 	h.Set("X-Marchilogs-Mem-Blocks-Scanned", strconv.Itoa(st.MemBlocksScanned))
 	h.Set("X-Marchilogs-Parts-Scanned", strconv.Itoa(st.PartsScanned))
+	h.Set("X-Marchilogs-Parts-Pruned-IndexDB", strconv.Itoa(st.PartsPrunedIndexDB))
 	h.Set("X-Marchilogs-Blocks-Seen", strconv.Itoa(st.BlocksSeen))
 	h.Set("X-Marchilogs-Blocks-Skipped-Bloom", strconv.Itoa(st.BlocksSkippedBloom))
 	h.Set("X-Marchilogs-Blocks-Scanned", strconv.Itoa(st.BlocksScanned))

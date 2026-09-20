@@ -110,6 +110,8 @@ type Storage struct {
 	wal     *wal
 	// manifests: day partition → active part ids (source of truth for Search).
 	manifests map[string][]string
+	// indexdbs: day → tag→part catalog for pruning parts before opening meta.
+	indexdbs map[string]*dayIndexDB
 
 	flushStop chan struct{}
 	flushDone chan struct{}
@@ -133,11 +135,15 @@ func Open(dir string, opts Options) (*Storage, error) {
 		buffers:   make(map[string]*memBlock),
 		partSeq:   make(map[string]int),
 		manifests: make(map[string][]string),
+		indexdbs:  make(map[string]*dayIndexDB),
 	}
 	if err := s.cleanupOrphanPublishing(); err != nil {
 		return nil, err
 	}
 	if err := s.loadManifestsLocked(); err != nil {
+		return nil, err
+	}
+	if err := s.loadIndexDBsLocked(); err != nil {
 		return nil, err
 	}
 	if err := s.loadPartSeq(); err != nil {
@@ -529,10 +535,17 @@ func (s *Storage) SearchWithStats(q Query) ([]Entry, QueryStats, error) {
 		return out[:q.Limit], st, nil
 	}
 	diskParts, err := s.listPublishedPartsLocked(q.Start, q.End)
-	s.mu.RUnlock()
 	if err != nil {
+		s.mu.RUnlock()
 		return nil, st, err
 	}
+	// Prune parts via day indexdb while still holding RLock (catalog can change on merge).
+	for day, ids := range diskParts {
+		filtered := s.partsMatchingStreamEq(day, ids, q.StreamEq)
+		st.PartsPrunedIndexDB += len(ids) - len(filtered)
+		diskParts[day] = filtered
+	}
+	s.mu.RUnlock()
 
 	partNames := keysOf(diskParts)
 	for _, partName := range partNames {

@@ -157,11 +157,10 @@ func (s *Storage) addPartToManifestLocked(day, partID string) error {
 		return fmt.Errorf("manifest add %s/%s: %w", day, partID, err)
 	}
 	s.manifests[day] = cur
-	return nil
+	return s.rebuildDayIndexDBLocked(day)
 }
 
 // replaceManifestPartsLocked removes removeIDs and adds addIDs in one manifest write.
-// Used by compaction (later).
 func (s *Storage) replaceManifestPartsLocked(day string, removeIDs, addIDs []string) error {
 	remove := make(map[string]struct{}, len(removeIDs))
 	for _, id := range removeIDs {
@@ -190,7 +189,7 @@ func (s *Storage) replaceManifestPartsLocked(day string, removeIDs, addIDs []str
 		return err
 	}
 	s.manifests[day] = out
-	return nil
+	return s.rebuildDayIndexDBLocked(day)
 }
 
 func maxPartID(ids []string) int {
