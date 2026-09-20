@@ -31,6 +31,12 @@ func main() {
 		"how often to look for small-part compaction; 0 disables background merge")
 	mergeMinParts := flag.Int("mergeMinParts", envIntOr("MARCHILOGS_MERGE_MIN_PARTS", 4),
 		"start merge when a day has at least this many small parts")
+	retention := flag.Duration("retentionPeriod",
+		envDurationOr("MARCHILOGS_RETENTION_PERIOD", 0),
+		"drop day partitions older than this (0 disables)")
+	retentionCheck := flag.Duration("retentionCheckInterval",
+		envDurationOr("MARCHILOGS_RETENTION_CHECK_INTERVAL", time.Hour),
+		"how often to apply retention; ignored when retentionPeriod is 0")
 	flag.Parse()
 
 	fields := splitCSV(*streamFields)
@@ -42,12 +48,18 @@ func main() {
 	if mergeEvery == 0 {
 		mergeEvery = -1
 	}
+	retCheck := *retentionCheck
+	if *retention <= 0 {
+		retCheck = -1
+	}
 	store, err := storage.Open(*dataDir, storage.Options{
 		StreamFields:              fields,
 		MaxRowsPerBlock:           *maxRows,
 		InmemoryDataFlushInterval: interval,
 		MergeCheckInterval:        mergeEvery,
 		MergeMinParts:             *mergeMinParts,
+		RetentionPeriod:           *retention,
+		RetentionCheckInterval:    retCheck,
 	})
 	if err != nil {
 		log.Fatalf("open storage: %v", err)
@@ -59,6 +71,9 @@ func main() {
 	}
 	if mergeEvery > 0 {
 		log.Printf("merge check every %s (minParts=%d)", mergeEvery, *mergeMinParts)
+	}
+	if *retention > 0 {
+		log.Printf("retention period %s (check every %s)", *retention, retCheck)
 	}
 
 	mux := http.NewServeMux()
@@ -82,7 +97,8 @@ func main() {
 			"GET  /query            — start,end,contains,limit + stream field equals\n"+
 			"GET  /healthz\n"+
 			"\nDurability: in-memory buffers flush to disk every -inmemoryDataFlushInterval (default 5s).\n"+
-			"Compaction: small parts merge into big when count ≥ -mergeMinParts (default 4).\n")
+			"Compaction: small parts merge into big when count ≥ -mergeMinParts (default 4).\n"+
+			"Retention: -retentionPeriod drops whole day dirs older than the period (0=off).\n")
 	})
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
