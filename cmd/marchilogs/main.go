@@ -26,6 +26,11 @@ func main() {
 	flushInterval := flag.Duration("inmemoryDataFlushInterval",
 		envDurationOr("MARCHILOGS_INMEMORY_DATA_FLUSH_INTERVAL", 5*time.Second),
 		"interval for guaranteed flush of in-memory data to disk (VictoriaLogs-style); min 1s; 0 disables")
+	mergeCheck := flag.Duration("mergeCheckInterval",
+		envDurationOr("MARCHILOGS_MERGE_CHECK_INTERVAL", 10*time.Second),
+		"how often to look for small-part compaction; 0 disables background merge")
+	mergeMinParts := flag.Int("mergeMinParts", envIntOr("MARCHILOGS_MERGE_MIN_PARTS", 4),
+		"start merge when a day has at least this many small parts")
 	flag.Parse()
 
 	fields := splitCSV(*streamFields)
@@ -33,10 +38,16 @@ func main() {
 	if interval == 0 {
 		interval = -1 // disable periodic flush in storage
 	}
+	mergeEvery := *mergeCheck
+	if mergeEvery == 0 {
+		mergeEvery = -1
+	}
 	store, err := storage.Open(*dataDir, storage.Options{
 		StreamFields:              fields,
 		MaxRowsPerBlock:           *maxRows,
 		InmemoryDataFlushInterval: interval,
+		MergeCheckInterval:        mergeEvery,
+		MergeMinParts:             *mergeMinParts,
 	})
 	if err != nil {
 		log.Fatalf("open storage: %v", err)
@@ -45,6 +56,9 @@ func main() {
 
 	if interval > 0 {
 		log.Printf("inmemory data flush interval %s (min enforced at 1s)", interval)
+	}
+	if mergeEvery > 0 {
+		log.Printf("merge check every %s (minParts=%d)", mergeEvery, *mergeMinParts)
 	}
 
 	mux := http.NewServeMux()
@@ -67,7 +81,8 @@ func main() {
 			"POST /flush            — Flush buffered rows to disk\n"+
 			"GET  /query            — start,end,contains,limit + stream field equals\n"+
 			"GET  /healthz\n"+
-			"\nDurability: in-memory buffers flush to disk every -inmemoryDataFlushInterval (default 5s).\n")
+			"\nDurability: in-memory buffers flush to disk every -inmemoryDataFlushInterval (default 5s).\n"+
+			"Compaction: small parts merge into big when count ≥ -mergeMinParts (default 4).\n")
 	})
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
@@ -320,4 +335,16 @@ func envDurationOr(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func envIntOr(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }

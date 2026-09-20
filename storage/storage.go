@@ -33,6 +33,21 @@ type Options struct {
 	// WALSync fsyncs the WAL after each Append batch (default true when WAL enabled).
 	// Set false for faster ingest with softer durability (OS buffer).
 	WALSync *bool
+
+	// MergeMinParts starts a small→big merge when a day has at least this many small parts.
+	// Default 4.
+	MergeMinParts int
+
+	// MergeMaxPartsPerJob caps how many small parts one merge consumes. Default 8.
+	MergeMaxPartsPerJob int
+
+	// MergeCheckInterval is how often the background worker looks for merge work.
+	// Default 10s; ≤0 disables the worker (manual/tests can still call runMergePass).
+	MergeCheckInterval time.Duration
+
+	// MergeDisable turns off the background merge worker only.
+	// Manual runMergePass still works (tests / force-merge later).
+	MergeDisable bool
 }
 
 func (o *Options) withDefaults() Options {
@@ -52,6 +67,7 @@ func (o *Options) withDefaults() Options {
 		v := true
 		out.WALSync = &v
 	}
+	out.withMergeDefaults()
 	return out
 }
 
@@ -88,6 +104,9 @@ type Storage struct {
 
 	flushStop chan struct{}
 	flushDone chan struct{}
+
+	mergeStop chan struct{}
+	mergeDone chan struct{}
 }
 
 // Open creates or opens a storage rooted at dir.
@@ -124,6 +143,7 @@ func Open(dir string, opts Options) (*Storage, error) {
 		}
 	}
 	s.startPeriodicFlush()
+	s.startPeriodicMerge()
 	return s, nil
 }
 
@@ -454,8 +474,9 @@ func (s *Storage) advanceWALCheckpointLocked(removedKeys map[string]struct{}) er
 	return s.wal.setCheckpoint(newCP)
 }
 
-// Close stops periodic flush, flushes buffers to parts, checkpoints WAL, and closes the WAL file.
+// Close stops background workers, flushes buffers to parts, checkpoints WAL, and closes the WAL file.
 func (s *Storage) Close() error {
+	s.stopPeriodicMerge()
 	if s.flushStop != nil {
 		close(s.flushStop)
 		<-s.flushDone
