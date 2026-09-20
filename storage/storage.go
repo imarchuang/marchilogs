@@ -83,6 +83,8 @@ type Storage struct {
 	buffers map[string]*memBlock // key: partition+"\x00"+stream
 	partSeq map[string]int       // next part id per partition
 	wal     *wal
+	// manifests: day partition → active part ids (source of truth for Search).
+	manifests map[string][]string
 
 	flushStop chan struct{}
 	flushDone chan struct{}
@@ -95,12 +97,16 @@ func Open(dir string, opts Options) (*Storage, error) {
 		return nil, err
 	}
 	s := &Storage{
-		root:    dir,
-		opts:    opts,
-		buffers: make(map[string]*memBlock),
-		partSeq: make(map[string]int),
+		root:      dir,
+		opts:      opts,
+		buffers:   make(map[string]*memBlock),
+		partSeq:   make(map[string]int),
+		manifests: make(map[string][]string),
 	}
 	if err := s.cleanupOrphanPublishing(); err != nil {
+		return nil, err
+	}
+	if err := s.loadManifestsLocked(); err != nil {
 		return nil, err
 	}
 	if err := s.loadPartSeq(); err != nil {
@@ -192,11 +198,14 @@ func (s *Storage) cleanupOrphanPublishing() error {
 			return err
 		}
 		for _, e := range entries {
-			if !e.IsDir() || !strings.HasPrefix(e.Name(), publishingPrefix) {
+			if !e.IsDir() {
 				continue
 			}
-			if err := os.RemoveAll(filepath.Join(partsDir, e.Name())); err != nil {
-				return err
+			name := e.Name()
+			if strings.HasPrefix(name, publishingPrefix) || strings.HasPrefix(name, ".merging-") {
+				if err := os.RemoveAll(filepath.Join(partsDir, name)); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -204,16 +213,24 @@ func (s *Storage) cleanupOrphanPublishing() error {
 }
 
 func (s *Storage) loadPartSeq() error {
+	for day, ids := range s.manifests {
+		if max := maxPartID(ids); max > s.partSeq[day] {
+			s.partSeq[day] = max
+		}
+	}
+	// Also scan dirs so seq stays ahead of orphan/tmp leftovers.
 	partsRoot := filepath.Join(s.root, "partitions")
 	days, err := os.ReadDir(partsRoot)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
 	for _, d := range days {
 		if !d.IsDir() {
 			continue
 		}
-		maxID := 0
 		partDir := filepath.Join(partsRoot, d.Name(), "parts")
 		entries, err := os.ReadDir(partDir)
 		if err != nil {
@@ -222,6 +239,7 @@ func (s *Storage) loadPartSeq() error {
 			}
 			return err
 		}
+		maxID := s.partSeq[d.Name()]
 		for _, e := range entries {
 			if !e.IsDir() || !isPublishedPartDir(e.Name()) {
 				continue
@@ -380,10 +398,16 @@ func (s *Storage) flushPartitionLocked(partition string) error {
 		return err
 	}
 
-	// Atomic publish: part becomes visible to readers only after rename succeeds.
+	// Atomic publish: part dir rename, then manifest swap (Search visibility).
 	if err := os.Rename(tmpDir, finalDir); err != nil {
 		rollback()
 		return fmt.Errorf("publish part %s: %w", finalName, err)
+	}
+	if err := s.addPartToManifestLocked(partition, finalName); err != nil {
+		// Part is on disk but invisible; Open will treat it as orphan and delete.
+		rollback()
+		_ = os.RemoveAll(finalDir)
+		return err
 	}
 
 	removed := make(map[string]struct{}, len(items))
@@ -514,36 +538,18 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 	return out, nil
 }
 
-// listPublishedPartsLocked returns partition → published part dir names.
-// Caller must hold s.mu for read or write (pairs with in-memory scan for a consistent view).
+// listPublishedPartsLocked returns partition → active part dir names from manifests.
+// Caller must hold s.mu for read or write.
 func (s *Storage) listPublishedPartsLocked(start, end time.Time) (map[string][]string, error) {
-	days, err := s.listPartitions(start, end)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string][]string{}, nil
+	out := make(map[string][]string)
+	for day, ids := range s.manifests {
+		if len(ids) == 0 {
+			continue
 		}
-		return nil, err
-	}
-	out := make(map[string][]string, len(days))
-	for _, day := range days {
-		partsDir := filepath.Join(s.root, "partitions", day, "parts")
-		entries, err := os.ReadDir(partsDir)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, err
+		if !partitionOverlapsQuery(day, start, end) {
+			continue
 		}
-		var names []string
-		for _, e := range entries {
-			if e.IsDir() && isPublishedPartDir(e.Name()) {
-				names = append(names, e.Name())
-			}
-		}
-		sort.Strings(names)
-		if len(names) > 0 {
-			out[day] = names
-		}
+		out[day] = append([]string(nil), ids...)
 	}
 	return out, nil
 }

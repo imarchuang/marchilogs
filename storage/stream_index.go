@@ -9,6 +9,7 @@ import (
 
 // partMeta is written beside each flushed part for stream discovery / prune.
 type partMeta struct {
+	Tier      string              `json:"tier,omitempty"` // "small" | "big"
 	TimeMinNS int64               `json:"time_min_ns"`
 	TimeMaxNS int64               `json:"time_max_ns"`
 	Streams   []streamMeta        `json:"streams"`
@@ -60,6 +61,7 @@ func tagKey(field, value string) string {
 
 func buildPartMeta(infos []streamFlushInfo, tMin, tMax int64) partMeta {
 	meta := partMeta{
+		Tier:      partTierSmall,
 		TimeMinNS: tMin,
 		TimeMaxNS: tMax,
 		Streams:   make([]streamMeta, 0, len(infos)),
