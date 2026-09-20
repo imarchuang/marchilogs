@@ -84,6 +84,7 @@ func main() {
 	mux.HandleFunc("/insert", handleInsert(store))
 	mux.HandleFunc("/flush", handleFlush(store))
 	mux.HandleFunc("/query", handleQuery(store, fields))
+	mux.HandleFunc("/internal/force_merge", handleForceMerge(store))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -95,6 +96,7 @@ func main() {
 			"POST /insert?flush=1   — Append then flush to disk\n"+
 			"POST /flush            — Flush buffered rows to disk\n"+
 			"GET  /query            — start,end,contains,limit + stream field equals\n"+
+			"POST /internal/force_merge?day=YYYYMMDD — compact small parts now\n"+
 			"GET  /healthz\n"+
 			"\nDurability: in-memory buffers flush to disk every -inmemoryDataFlushInterval (default 5s).\n"+
 			"Compaction: small parts merge into big when count ≥ -mergeMinParts (default 4).\n"+
@@ -166,6 +168,22 @@ func handleFlush(store *storage.Storage) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"flushed": true})
+	}
+}
+
+func handleForceMerge(store *storage.Storage) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		day := strings.TrimSpace(r.URL.Query().Get("day"))
+		if err := store.ForceMerge(day); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "day": day})
 	}
 }
 
