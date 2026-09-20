@@ -101,6 +101,7 @@ func (s *Storage) dropDayLocked(day string) error {
 		}
 	}
 	delete(s.manifests, day)
+	delete(s.indexdbs, day)
 	delete(s.partSeq, day)
 
 	dayDir := filepath.Join(s.root, "partitions", day)

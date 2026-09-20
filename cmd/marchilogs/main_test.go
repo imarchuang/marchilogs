@@ -194,6 +194,8 @@ func TestQueryStatsHeaders(t *testing.T) {
 		t.Fatalf("want _stats line, got %s", qrr.Body.String())
 	}
 }
+
+func TestForceMergeHTTP(t *testing.T) {
 	dir := t.TempDir()
 	store, err := storage.Open(dir, storage.Options{
 		StreamFields:              []string{"service"},

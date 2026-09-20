@@ -5,8 +5,11 @@ type QueryStats struct {
 	// MemBlocksScanned is in-memory stream buffers examined (after day/stream/time prune).
 	MemBlocksScanned int `json:"mem_blocks_scanned"`
 
-	// PartsScanned is published disk parts opened from the manifest.
+	// PartsScanned is published disk parts whose meta/blocks we opened.
 	PartsScanned int `json:"parts_scanned"`
+
+	// PartsPrunedIndexDB is manifest parts skipped via the day indexdb stream catalog.
+	PartsPrunedIndexDB int `json:"parts_pruned_indexdb"`
 
 	// BlocksSeen is disk blocks that passed stream + block-time filters.
 	BlocksSeen int `json:"blocks_seen"`
