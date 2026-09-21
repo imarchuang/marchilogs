@@ -237,3 +237,51 @@ func TestForceMergeHTTP(t *testing.T) {
 		t.Fatalf("parts after force_merge: %d", got)
 	}
 }
+
+func TestDeleteHTTP(t *testing.T) {
+	dir := t.TempDir()
+	store, err := storage.Open(dir, storage.Options{
+		StreamFields:              []string{"service"},
+		MaxRowsPerBlock:           1000,
+		InmemoryDataFlushInterval: -1,
+		MergeCheckInterval:        -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/insert", handleInsert(store))
+	mux.HandleFunc("/query", handleQuery(store, []string{"service"}))
+	mux.HandleFunc("/delete", handleDelete(store, []string{"service"}))
+
+	body := `{"_msg":"hello secret","service":"api"}`
+	req := httptest.NewRequest(http.MethodPost, "/insert?flush=1", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("insert: %s", rr.Body.String())
+	}
+
+	dreq := httptest.NewRequest(http.MethodPost, "/delete?contains=secret", nil)
+	drr := httptest.NewRecorder()
+	mux.ServeHTTP(drr, dreq)
+	if drr.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", drr.Code, drr.Body.String())
+	}
+
+	qreq := httptest.NewRequest(http.MethodGet, "/query?stats=1", nil)
+	qrr := httptest.NewRecorder()
+	mux.ServeHTTP(qrr, qreq)
+	if qrr.Code != http.StatusOK {
+		t.Fatalf("query: %s", qrr.Body.String())
+	}
+	if qrr.Header().Get("X-Marchilogs-Rows-Returned") != "0" {
+		t.Fatalf("want 0 returned, headers=%v body=%s", qrr.Header(), qrr.Body.String())
+	}
+	if qrr.Header().Get("X-Marchilogs-Rows-Suppressed-Delete") == "" ||
+		qrr.Header().Get("X-Marchilogs-Rows-Suppressed-Delete") == "0" {
+		t.Fatalf("want suppressed>0, got %q", qrr.Header().Get("X-Marchilogs-Rows-Suppressed-Delete"))
+	}
+}

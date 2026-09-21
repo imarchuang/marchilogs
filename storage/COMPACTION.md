@@ -21,7 +21,9 @@ Without merge, part count grows ≈ `ingest_duration / flush_interval`. Search l
 3. Run in background; never block `Append` except briefly for metadata swap.
 4. Stay single-process; no cluster.
 
-Non-goals for v0: tiering to object storage, force-merge HTTP (can add later), cross-day merge, delete-by-query.
+Non-goals for v0: tiering to object storage, force-merge HTTP (can add later), cross-day merge.
+Delete-by-query is separate — see [TOMBSTONE.md](TOMBSTONE.md) (logical predicate
+tombstones; physical reclaim during merge is a later slice).
 
 ## Part tiers (names)
 

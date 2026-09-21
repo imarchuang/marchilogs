@@ -112,6 +112,9 @@ type Storage struct {
 	manifests map[string][]string
 	// indexdbs: day → tag→part catalog for pruning parts before opening meta.
 	indexdbs map[string]*dayIndexDB
+	// deletes: day → tombstone predicates (logical deletes).
+	deletes   map[string][]deleteRecord
+	deleteSeq map[string]int
 
 	flushStop chan struct{}
 	flushDone chan struct{}
@@ -136,6 +139,8 @@ func Open(dir string, opts Options) (*Storage, error) {
 		partSeq:   make(map[string]int),
 		manifests: make(map[string][]string),
 		indexdbs:  make(map[string]*dayIndexDB),
+		deletes:   make(map[string][]deleteRecord),
+		deleteSeq: make(map[string]int),
 	}
 	if err := s.cleanupOrphanPublishing(); err != nil {
 		return nil, err
@@ -144,6 +149,9 @@ func Open(dir string, opts Options) (*Storage, error) {
 		return nil, err
 	}
 	if err := s.loadIndexDBsLocked(); err != nil {
+		return nil, err
+	}
+	if err := s.loadDeletesLocked(); err != nil {
 		return nil, err
 	}
 	if err := s.loadPartSeq(); err != nil {
@@ -528,7 +536,8 @@ func (s *Storage) Search(q Query) ([]Entry, error) {
 func (s *Storage) SearchWithStats(q Query) ([]Entry, QueryStats, error) {
 	var st QueryStats
 	s.mu.RLock()
-	out := s.searchBuffersRLocked(q, nil, &st)
+	tombstones := s.deletesOverlappingQueryLocked(q.Start, q.End)
+	out := s.searchBuffersRLocked(q, nil, &st, tombstones)
 	if q.Limit > 0 && len(out) >= q.Limit {
 		s.mu.RUnlock()
 		st.RowsReturned = len(out)
@@ -549,6 +558,7 @@ func (s *Storage) SearchWithStats(q Query) ([]Entry, QueryStats, error) {
 
 	partNames := keysOf(diskParts)
 	for _, partName := range partNames {
+		dayDels := tombstones[partName]
 		for _, peName := range diskParts[partName] {
 			st.PartsScanned++
 			partDir := filepath.Join(s.root, "partitions", partName, "parts", peName)
@@ -588,6 +598,10 @@ func (s *Storage) SearchWithStats(q Query) ([]Entry, QueryStats, error) {
 							continue
 						}
 						if q.Contains != "" && !strings.Contains(e.Msg(), q.Contains) {
+							continue
+						}
+						if entryHiddenByDeletes(e, dayDels) {
+							st.RowsSuppressedDelete++
 							continue
 						}
 						out = append(out, e)
