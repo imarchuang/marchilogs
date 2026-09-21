@@ -23,6 +23,9 @@ type QueryStats struct {
 	// RowsScanned is rows iterated in memory + on disk (before Contains/time row filters may drop them).
 	RowsScanned int `json:"rows_scanned"`
 
+	// RowsSuppressedDelete is rows hidden by tombstones during Search.
+	RowsSuppressedDelete int `json:"rows_suppressed_delete"`
+
 	// RowsReturned is len of the result set.
 	RowsReturned int `json:"rows_returned"`
 }

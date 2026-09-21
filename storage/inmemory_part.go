@@ -7,7 +7,7 @@ import (
 
 // searchBuffersRLocked scans live memBlocks under s.mu.RLock (no clone).
 // Append/Flush take the write lock, so buffers are stable for the duration of the scan.
-func (s *Storage) searchBuffersRLocked(q Query, out []Entry, st *QueryStats) []Entry {
+func (s *Storage) searchBuffersRLocked(q Query, out []Entry, st *QueryStats, tombstones map[string][]deleteRecord) []Entry {
 	for key, b := range s.buffers {
 		if b == nil || b.rows() == 0 {
 			continue
@@ -25,6 +25,7 @@ func (s *Storage) searchBuffersRLocked(q Query, out []Entry, st *QueryStats) []E
 		if st != nil {
 			st.MemBlocksScanned++
 		}
+		dayDels := tombstones[part]
 		for i := 0; i < b.rows(); i++ {
 			if st != nil {
 				st.RowsScanned++
@@ -37,6 +38,12 @@ func (s *Storage) searchBuffersRLocked(q Query, out []Entry, st *QueryStats) []E
 				continue
 			}
 			if q.Contains != "" && !strings.Contains(e.Msg(), q.Contains) {
+				continue
+			}
+			if entryHiddenByDeletes(e, dayDels) {
+				if st != nil {
+					st.RowsSuppressedDelete++
+				}
 				continue
 			}
 			out = append(out, e)

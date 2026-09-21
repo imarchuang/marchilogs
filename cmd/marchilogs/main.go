@@ -84,6 +84,7 @@ func main() {
 	mux.HandleFunc("/insert", handleInsert(store))
 	mux.HandleFunc("/flush", handleFlush(store))
 	mux.HandleFunc("/query", handleQuery(store, fields))
+	mux.HandleFunc("/delete", handleDelete(store, fields))
 	mux.HandleFunc("/internal/force_merge", handleForceMerge(store))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -98,11 +99,13 @@ func main() {
 			"GET  /query            — start,end,contains,limit + stream field equals\n"+
 			"                       add stats=1 for a trailing {_stats:...} NDJSON line\n"+
 			"                       (headers X-Marchilogs-*-Scanned always set)\n"+
+			"POST /delete           — logical delete (tombstone): start,end,contains + stream equals\n"+
 			"POST /internal/force_merge?day=YYYYMMDD — compact small parts now\n"+
 			"GET  /healthz\n"+
 			"\nDurability: in-memory buffers flush to disk every -inmemoryDataFlushInterval (default 5s).\n"+
 			"Compaction: small parts merge into big when count ≥ -mergeMinParts (default 4).\n"+
-			"Retention: -retentionPeriod drops whole day dirs older than the period (0=off).\n")
+			"Retention: -retentionPeriod drops whole day dirs older than the period (0=off).\n"+
+			"Deletes: tombstones hide matching rows from Search; physical reclaim comes later via compaction.\n")
 	})
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
@@ -189,6 +192,48 @@ func handleForceMerge(store *storage.Storage) http.HandlerFunc {
 	}
 }
 
+func handleDelete(store *storage.Storage, streamFields []string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		q := r.URL.Query()
+		start, err := parseTimeParam(q.Get("start"))
+		if err != nil {
+			http.Error(w, "bad start: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		end, err := parseTimeParam(q.Get("end"))
+		if err != nil {
+			http.Error(w, "bad end: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		streamEq := map[string]string{}
+		for _, f := range streamFields {
+			if v := q.Get(f); v != "" {
+				streamEq[f] = v
+			}
+		}
+		spec := storage.DeleteSpec{
+			Start:    start,
+			End:      end,
+			StreamEq: streamEq,
+			Contains: q.Get("contains"),
+		}
+		purged, err := store.Delete(spec)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":         true,
+			"purged_mem": purged,
+		})
+	}
+}
+
 func wantFlush(r *http.Request) bool {
 	v := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("flush")))
 	switch v {
@@ -271,6 +316,7 @@ func writeQueryStatsHeaders(w http.ResponseWriter, st storage.QueryStats) {
 	h.Set("X-Marchilogs-Blocks-Skipped-Bloom", strconv.Itoa(st.BlocksSkippedBloom))
 	h.Set("X-Marchilogs-Blocks-Scanned", strconv.Itoa(st.BlocksScanned))
 	h.Set("X-Marchilogs-Rows-Scanned", strconv.Itoa(st.RowsScanned))
+	h.Set("X-Marchilogs-Rows-Suppressed-Delete", strconv.Itoa(st.RowsSuppressedDelete))
 	h.Set("X-Marchilogs-Rows-Returned", strconv.Itoa(st.RowsReturned))
 }
 
